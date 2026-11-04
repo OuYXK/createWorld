@@ -1,0 +1,163 @@
+name: create-world
+
+# 用法：
+#   cd backend/create_world/deploy
+#   copy .env.example .env
+#   docker compose up -d                    # 只起 PG + Redis（阶段 1 够用）
+#   docker compose --profile full up -d     # 全起（含 Kafka + MinIO）
+#   docker compose ps
+#   docker compose logs -f postgres
+#
+# 镜像源：所有 image 都带 ${MIRROR:-} 前缀，默认（空值）走 Docker Hub 官方。
+#   若国内直连 Docker Hub 失败，在 .env 里设置 MIRROR=<可用镜像站前缀，末尾带 />
+#   优先方案仍是给 Docker 配置 registry-mirrors（见 deploy/README-环境说明.md）
+#
+# 数据落在 ./data 下，删库重来：docker compose down -v 且删除 ./data
+
+services:
+  postgres:
+    image: "${MIRROR:-}pgvector/pgvector:pg17"
+    container_name: cw-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PG_DB:-create_world}
+      POSTGRES_USER: ${PG_USER:-cw}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-cw123456}
+      TZ: Asia/Shanghai
+      PGTZ: Asia/Shanghai
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - max_connections=100
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - timezone=Asia/Shanghai
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-cw} -d ${PG_DB:-create_world}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  redis:
+    image: "${MIRROR:-}redis:7.4-alpine"
+    container_name: cw-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      # 这个库同时存缓存、分布式锁、任务进度，锁被淘汰会导致并发失控，
+      # 因此使用 noeviction（内存不够时报错而不是静默删 key）
+      - --maxmemory-policy
+      - noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  kafka:
+    image: "${MIRROR:-}apache/kafka:3.9.0"
+    container_name: cw-kafka
+    restart: unless-stopped
+    profiles: ["full"]
+    ports:
+      - "9092:9092"
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_RETENTION_HOURS: 72
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx1g"
+    volumes:
+      - ./data/kafka:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  # 可选：Kafka 图形界面，浏览器打开 http://localhost:8090
+  kafka-ui:
+    image: "${MIRROR:-}provectuslabs/kafka-ui:latest"
+    container_name: cw-kafka-ui
+    restart: unless-stopped
+    profiles: ["full"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+  minio:
+    image: "${MIRROR:-}minio/minio:latest"
+    container_name: cw-minio
+    restart: unless-stopped
+    profiles: ["full"]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_AK:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SK:-minioadmin}
+      TZ: Asia/Shanghai
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # 控制台 http://localhost:9001
+    volumes:
+      - ./data/minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  # 首次启动自动建 bucket 并设为匿名可读（仅本地开发用）
+  minio-init:
+    image: "${MIRROR:-}minio/mc:latest"
+    container_name: cw-minio-init
+    profiles: ["full"]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD} &&
+      mc mb -p local/${MINIO_BUCKET:-create-world} &&
+      mc anonymous set download local/${MINIO_BUCKET:-create-world} &&
+      echo 'minio bucket ready'
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_AK:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SK:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-create-world}

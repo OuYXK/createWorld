@@ -1,0 +1,99 @@
+# 本地开发环境（Docker Compose 提供的基础设施）
+# 启用方式：启动时默认已激活（见 application.yaml 的 spring.profiles.active），
+#          也可显式指定 -Dspring.profiles.active=local
+#
+# 说明：
+# 1) 当前 pom 还没有引入数据访问 starter（MyBatis-Plus / JDBC），
+#    所以 spring.datasource 配置暂时读不到、也不会报错；补齐依赖后立即生效。
+# 2) 未启动 Kafka / MinIO 时应用仍可启动（客户端懒连接），
+#    只有真正发消息 / 上传文件时才会失败。
+
+server:
+  port: 8080
+
+spring:
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    # stringtype=unspecified 让 pgvector / jsonb 的字符串参数可以直接绑定
+    url: jdbc:postgresql://localhost:5432/${PG_DB:create_world}?stringtype=unspecified&reWriteBatchedInserts=true
+    username: ${PG_USER:cw}
+    password: ${PG_PASSWORD:cw123456}
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 5000
+      pool-name: cw-hikari
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      database: 0
+      timeout: 3s
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+
+  kafka:
+    bootstrap-servers: ${KAFKA_SERVERS:localhost:9092}
+    producer:
+      acks: all
+      retries: 2
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    consumer:
+      group-id: create-world-local
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      properties:
+        max.poll.interval.ms: 600000
+
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 20MB
+
+  # 当前 pom 引入了 elasticsearch starter 但阶段 1~3 不使用，
+  # 若启动日志出现 ES 连接告警且影响健康检查，取消下面注释（类名需按 Boot 4 实际包名确认）：
+  # autoconfigure:
+  #   exclude:
+  #     - org.springframework.boot.autoconfigure.elasticsearch.ElasticsearchClientAutoConfiguration
+
+# 补齐 MyBatis-Plus 依赖后生效
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    # 本地需要看 SQL 时打开
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
+  global-config:
+    banner: false
+    db-config:
+      id-type: assign_id          # 雪花 ID
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+createworld:
+  ai:
+    chat-model-light: qwen-turbo
+    chat-model-deep: qwen-plus
+    embedding-model: text-embedding-v3
+    embedding-dimension: 1024
+    temperature: 0.3
+    prompt-version: v1
+    deep-daily-quota: 5
+  dedup:
+    warn-threshold: 0.85
+    suggest-threshold: 0.75
+    top-k: 5
+
+logging:
+  level:
+    root: info
+    com.example.create_world: debug
+    org.springframework.ai: debug
